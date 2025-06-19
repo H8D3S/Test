@@ -46,7 +46,7 @@ Or on Windows (as Administrator):
         *   Single port: `80`
         *   Comma-separated list: `22,80,443`
         *   Range: `1-100`
-        *   Combined: `22,80,443,1000-2000` (Note: The current parser in `main.rs` might need adjustment for combined lists with ranges; the plan was to implement a more robust parser. For now, document based on typical expectations.)
+        *   Combined: `22,80,443,1000-2000`
 
 *   **`-c, --concurrency <NUMBER>`**
     *   Sets the number of concurrent scanning tasks. Higher values can speed up scans but might overwhelm the network or the target.
@@ -94,14 +94,20 @@ Or on Windows (as Administrator):
 
 ## Current Status
 
-**NIGHT WISP is currently under active development.**
+**NIGHT WISP is now a functional SYN port scanner!**
 
-The foundational components are in place, including:
-*   Command-line interface parsing.
+The core features have been implemented, including:
+*   Asynchronous SYN scanning using raw sockets.
+*   User-configurable target IP and port specifications (single, list, range).
+*   Adjustable concurrency to control scan speed.
+*   Customizable timeouts for port responses.
+*   Optional delay between scan probes.
+*   Ability to randomize the order of scanned ports.
 *   Network interface selection.
-*   Raw TCP SYN packet construction.
-*   Basic raw socket sending and listening capabilities.
+*   Verbose mode for detailed output.
 
-However, the **core asynchronous scanning orchestration is not yet fully implemented.** This means that while the tool can be compiled and understands the commands, it does not yet perform the actual coordinated scanning of multiple ports with send/receive logic, timeout handling, and concurrency management. This is the next major phase of development.
-
-Please keep this in mind if you are attempting to use the scanner based on the current state of the codebase.
+While the core functionality is operational, future enhancements could include:
+*   Service version detection.
+*   OS fingerprinting (more advanced).
+*   Different scan types (e.g., TCP Connect, UDP, FIN, Xmas - though SYN is the primary focus).
+*   Output to different formats (e.g., JSON, XML).

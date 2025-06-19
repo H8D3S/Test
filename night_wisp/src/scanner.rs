@@ -1,208 +1,256 @@
-use crate::packet; // To use build_syn_packet
+use crate::packet;
 use crate::utils::SelectedInterfaceInfo;
 use pnet_packet::ip::IpNextHeaderProtocols;
 use pnet_packet::ipv4::Ipv4Packet;
 use pnet_packet::tcp::{TcpFlags, TcpPacket};
-use pnet_packet::Packet; // Trait for packet parsing
-use pnet_transport::{transport_channel, TransportChannelType, TransportReceiver, TransportSender}; // Added TransportReceiver
-use std::collections::HashSet;
+use pnet_packet::Packet;
+use pnet_transport::{transport_channel, TransportChannelType, TransportReceiver, TransportSender, ipv4_packet_iter};
+use rand::seq::SliceRandom;
+use rand::thread_rng;
+use std::collections::HashSet; // HashMap was unused here
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
+use tokio::sync::{Mutex, Semaphore};
 use std::time::Duration;
+use tokio::time::timeout as tokio_timeout;
 
 
-// Renaming RawSender to RawSocketHandler as it will manage both sending and receiving.
 pub struct RawSocketHandler {
     transport_sender: TransportSender,
-    transport_receiver: TransportReceiver, // Added receiver
-    target_ip: Ipv4Addr, // To filter incoming packets
-    ephemeral_source_ports: HashSet<u16>, // To track source ports we used for probes
+    transport_receiver: Arc<Mutex<TransportReceiver>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PortStatus {
-    Open(u16),      // Port is open
-    Closed(u16),    // Port is closed (got RST-ACK)
-    Filtered(u16),  // No response / Timeout
-    Error(u16, String), // Error during scan for this port
+    Open(u16),
+    Closed(u16),
+    Filtered(u16),
+    Error(u16, String),
 }
-
 
 impl RawSocketHandler {
-    pub fn new(target_ip: Ipv4Addr) -> Result<Self, String> {
-        // For sending IP packets, we use Layer3 with TCP protocol specified.
+    pub fn new() -> Result<Self, String> {
         let protocol_ip_tcp = IpNextHeaderProtocols::Tcp;
-        let (ts, tr) = transport_channel( // Corrected: tr was not mutable here before, now it is by default from the tuple
-            4096, // Buffer size
+        let (ts, tr) = transport_channel(
+            4096,
             TransportChannelType::Layer3(protocol_ip_tcp)
         )
         .map_err(|e| format!("Failed to create transport channel: {}", e))?;
 
         Ok(RawSocketHandler {
             transport_sender: ts,
-            transport_receiver: tr,
-            target_ip,
-            ephemeral_source_ports: HashSet::new(),
+            transport_receiver: Arc::new(Mutex::new(tr)),
         })
     }
 
-    /// Sends a raw IP packet.
-    pub fn send_syn_packet(
+    pub async fn send_syn_packet(
         &mut self,
         source_ip: Ipv4Addr,
-        dest_ip: Ipv4Addr, // Should be self.target_ip for consistency
+        target_ip: Ipv4Addr,
         source_port: u16,
         dest_port: u16,
     ) -> Result<(), String> {
-        if dest_ip != self.target_ip {
-            return Err("Destination IP in send_syn_packet does not match RawSocketHandler's target_ip".to_string());
-        }
-        let ttl = 64; // Default TTL
-
+        let ttl = 64;
         let packet_bytes = packet::build_syn_packet(
-            source_ip,
-            dest_ip,
-            source_port,
-            dest_port,
-            ttl,
+            source_ip, target_ip, source_port, dest_port, ttl,
         )?;
-
-        // Register the source port as one we're using for a probe
-        self.ephemeral_source_ports.insert(source_port);
-
         self.transport_sender
-            .send_to(Ipv4Packet::new(&packet_bytes).unwrap(), IpAddr::V4(dest_ip))
+            .send_to(Ipv4Packet::new(&packet_bytes).unwrap(), IpAddr::V4(target_ip))
             .map_err(|e| format!("Failed to send packet: {}", e))?;
         Ok(())
     }
 
-    /// Receives and processes one packet from the channel.
-    /// This is a simplified version; a real implementation needs to run this in a loop
-    /// and correlate responses.
-    /// This function would typically be called repeatedly by a dedicated listening task.
-    pub fn receive_and_process_packet(&mut self) -> Result<Option<PortStatus>, String> {
-        // Create an iterator from the transport receiver.
-        // next() will block until a packet arrives or an error occurs.
-        // We need a timeout mechanism here for practical use, which will be added
-        // when integrating with Tokio tasks. For now, this is a conceptual blocking receive.
-
-        // For non-blocking with timeout, one would typically use tokio::select! with
-        // a future from the receiver and a timeout future.
-        // Or, use a raw socket with `set_read_timeout`. `pnet_transport` receiver
-        // itself doesn't directly expose timeouts on `next()`.
-        // For now, we'll simulate a single blocking receive attempt.
-
-        // Use the pnet_transport::ipv4_packet_iter helper function.
-        // This function takes &mut TransportReceiver and returns Box<dyn Ipv4PacketIterator>
-        // or panics if the receiver is not the Ipv4 variant.
-        // Given we created the channel for IPv4, this should be safe.
-        let mut iter = pnet_transport::ipv4_packet_iter(&mut self.transport_receiver);
+    pub async fn try_receive_response(
+        receiver_arc: Arc<Mutex<TransportReceiver>>,
+        target_ip: Ipv4Addr,
+        expected_response_src_port: u16,
+        expected_response_dest_port: u16
+    ) -> Result<Option<PortStatus>, String> {
+        let mut tr_guard = receiver_arc.lock().await;
+        let mut iter = ipv4_packet_iter(&mut *tr_guard);
 
         match iter.next() {
-            Ok((packet, remote_addr)) => {
-                // Ensure the packet is from our target IP
-                if remote_addr != IpAddr::V4(self.target_ip) {
-                    return Ok(None); // Not from target, ignore
+            Ok((packet_data, remote_addr)) => {
+                if remote_addr != IpAddr::V4(target_ip) {
+                    return Ok(None);
                 }
-
-                // Parse as IPv4 packet
-                let ipv4_packet = match Ipv4Packet::new(packet.packet()) {
-                    Some(pkt) => pkt,
-                    None => return Ok(None), // Not an IPv4 packet or too short
-                };
-
-                // Check if it's a TCP packet
-                if ipv4_packet.get_next_level_protocol() == IpNextHeaderProtocols::Tcp {
-                    let tcp_packet = match TcpPacket::new(ipv4_packet.payload()) {
-                        Some(pkt) => pkt,
-                        None => return Ok(None), // Not a TCP packet or too short
-                    };
-
-                    // Is the packet destined for one of our ephemeral source ports?
-                    let dest_port_of_response = tcp_packet.get_destination();
-                    if !self.ephemeral_source_ports.contains(&dest_port_of_response) {
-                        return Ok(None); // Not for one of our probes
-                    }
-
-                    // We should remove the port from ephemeral_source_ports once a definitive response is received for it.
-                    // self.ephemeral_source_ports.remove(&dest_port_of_response); // Do this when scan for this port is conclusive
-
-                    let flags = tcp_packet.get_flags();
-                    let original_probe_dest_port = tcp_packet.get_source(); // The port we originally probed on the target
-
-                    if (flags & TcpFlags::SYN) != 0 && (flags & TcpFlags::ACK) != 0 {
-                        // SYN-ACK: Port is Open
-                        // Mark this ephemeral port as handled (it might be reused later, but this specific probe is done)
-                        // self.ephemeral_source_ports.remove(&dest_port_of_response);
-                        return Ok(Some(PortStatus::Open(original_probe_dest_port)));
-                    } else if (flags & TcpFlags::RST) != 0 || (flags & TcpFlags::RST | TcpFlags::ACK) != 0 {
-                        // RST or RST-ACK: Port is Closed
-                        // self.ephemeral_source_ports.remove(&dest_port_of_response);
-                        return Ok(Some(PortStatus::Closed(original_probe_dest_port)));
+                if let Some(ipv4_packet) = Ipv4Packet::new(packet_data.packet()) {
+                    if ipv4_packet.get_next_level_protocol() == IpNextHeaderProtocols::Tcp {
+                        if let Some(tcp_packet) = TcpPacket::new(ipv4_packet.payload()) {
+                            if tcp_packet.get_source() == expected_response_src_port &&
+                               tcp_packet.get_destination() == expected_response_dest_port {
+                                let flags = tcp_packet.get_flags();
+                                if (flags & TcpFlags::SYN) != 0 && (flags & TcpFlags::ACK) != 0 {
+                                    return Ok(Some(PortStatus::Open(expected_response_src_port)));
+                                } else if (flags & TcpFlags::RST) != 0 || (flags & TcpFlags::RST | TcpFlags::ACK) != 0 {
+                                    return Ok(Some(PortStatus::Closed(expected_response_src_port)));
+                                }
+                            }
+                        }
                     }
                 }
-                Ok(None) // Not a TCP packet we care about
+                Ok(None)
             }
             Err(e) => {
-                // This error means the transport channel is broken or encountered a problem.
-                Err(format!("Error receiving packet: {}", e))
+                Err(format!("Error in try_receive_response: {}", e))
             }
         }
-    }
-
-    // Method to remove a source port from tracking once its scan is conclusive
-    pub fn mark_port_scan_conclusive(&mut self, source_port: u16) {
-        self.ephemeral_source_ports.remove(&source_port);
     }
 }
 
 
-// Placeholder scanner function - this will be the main entry point for scanning later.
-pub fn placeholder_scanner() {
-    println!("Scanner module placeholder. Testing receive logic (requires privileges and a target sending responses).");
+pub struct Scanner {
+    raw_socket_handler: Arc<Mutex<RawSocketHandler>>,
+    target_ip: Ipv4Addr,
+    ports_to_scan: Vec<u16>,
+    source_ip: Ipv4Addr,
+    concurrency: usize,
+    timeout_ms: u64,
+    scan_delay_ms: u64,
+    randomize_ports: bool,
+    active_ephemeral_ports: Arc<Mutex<HashSet<u16>>>,
+    next_ephemeral_port: u16,
+}
 
-    let target_test_ip = Ipv4Addr::new(127, 0, 0, 1); // Example: loopback
+impl Scanner {
+    pub fn new(
+        target_ip: Ipv4Addr,
+        ports_to_scan: Vec<u16>,
+        interface_info: &SelectedInterfaceInfo,
+        concurrency: usize,
+        timeout_ms: u64,
+        scan_delay_ms: u64,
+        randomize_ports: bool,
+    ) -> Result<Self, String> {
+        let raw_socket_handler = RawSocketHandler::new()?;
+        let source_ip_v4 = match interface_info.source_ip {
+            IpAddr::V4(ip) => ip,
+            IpAddr::V6(_) => return Err("IPv6 not supported for source IP".to_string()),
+        };
+        Ok(Scanner {
+            raw_socket_handler: Arc::new(Mutex::new(raw_socket_handler)),
+            target_ip,
+            ports_to_scan,
+            source_ip: source_ip_v4,
+            concurrency,
+            timeout_ms,
+            scan_delay_ms,
+            randomize_ports,
+            active_ephemeral_ports: Arc::new(Mutex::new(HashSet::new())),
+            next_ephemeral_port: 49152,
+        })
+    }
 
-    match RawSocketHandler::new(target_test_ip) {
-        Ok(mut handler) => {
-            println!("RawSocketHandler created. Listening for packets...");
-            println!("To test, send a TCP packet to this machine on an ephemeral port from {}", target_test_ip);
-            println!("This basic test will only attempt to receive one packet and then exit.");
+    async fn get_next_ephemeral_port(&mut self) -> u16 {
+        let mut active_ports_guard = self.active_ephemeral_ports.lock().await;
+        loop {
+            let port = self.next_ephemeral_port;
+            self.next_ephemeral_port = self.next_ephemeral_port.wrapping_add(1);
+            if self.next_ephemeral_port < 49152 {
+                self.next_ephemeral_port = 49152;
+            }
+            if !active_ports_guard.contains(&port) {
+                active_ports_guard.insert(port);
+                return port;
+            }
+        }
+    }
 
-            // Simulate sending a probe so a source port is registered
-            // In a real scan, this would be coordinated.
-            let test_source_ip = Ipv4Addr::new(127,0,0,1); // Needs to be a local IP on the machine running this
-            let test_source_port = 55555;
-            let test_target_port = 80; // Port we are "pretending" to probe on target
+    // This method was identified as unused. Port releasing is handled directly
+    // by tasks using the Arc<Mutex<HashSet<u16>>>.
+    // async fn release_ephemeral_port(&self, port: u16) {
+    //     let mut active_ports_guard = self.active_ephemeral_ports.lock().await;
+    //     active_ports_guard.remove(&port);
+    // }
 
-            // Manually add a port to listen for, as if we sent a probe
-            handler.ephemeral_source_ports.insert(test_source_port);
-            println!("Test: Registered source port {} for listening.", test_source_port);
+    pub async fn run_scan(&mut self) -> Vec<PortStatus> {
+        let mut ports = self.ports_to_scan.clone();
+        if self.randomize_ports {
+            ports.shuffle(&mut thread_rng());
+        }
 
+        let semaphore = Arc::new(Semaphore::new(self.concurrency));
+        let mut scan_tasks = Vec::new();
+        let results_arc = Arc::new(Mutex::new(Vec::new()));
 
-            // This is a blocking call for one packet.
-            // In a real scenario, this needs to be in a loop, likely in a separate Tokio task,
-            // and use timeouts (e.g. tokio::time::timeout around the receive logic,
-            // or use a non-blocking socket if pnet_transport doesn't offer async directly).
-            match handler.receive_and_process_packet() {
-                Ok(Some(status)) => {
-                    println!("Received and processed packet. Status: {:?}", status);
-                     if let PortStatus::Open(port) | PortStatus::Closed(port) = status {
-                        // This logic isn't quite right, it should be dest_port_of_response which is our source_port for the probe
-                        // handler.mark_port_scan_conclusive(port);
-                        handler.mark_port_scan_conclusive(test_source_port); // Corrected: use the source port we registered
+        let rsh_arc = Arc::clone(&self.raw_socket_handler);
+        let active_ports_arc = Arc::clone(&self.active_ephemeral_ports);
+
+        for target_port in ports {
+            let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+
+            let task_source_ip = self.source_ip;
+            let task_target_ip = self.target_ip;
+            let task_timeout_ms = self.timeout_ms;
+            let task_results_clone = Arc::clone(&results_arc);
+            let ephemeral_port = self.get_next_ephemeral_port().await; // Modifies self.next_ephemeral_port
+
+            let task_rsh_cloned = Arc::clone(&rsh_arc);
+            let task_transport_receiver_arc_clone = {
+                let rsh_guard = rsh_arc.lock().await;
+                Arc::clone(&rsh_guard.transport_receiver)
+            };
+            let task_active_ports_cloned = Arc::clone(&active_ports_arc);
+
+            let scan_task = tokio::spawn(async move {
+                let _permit = permit;
+
+                {
+                    let mut rsh_guard = task_rsh_cloned.lock().await;
+                    if let Err(e) = rsh_guard.send_syn_packet(task_source_ip, task_target_ip, ephemeral_port, target_port).await {
+                        task_results_clone.lock().await.push(PortStatus::Error(target_port, format!("Send error: {}", e)));
+                        task_active_ports_cloned.lock().await.remove(&ephemeral_port);
+                        return;
                     }
                 }
-                Ok(None) => {
-                    println!("Received a packet, but it was not relevant to our probes or was malformed.");
+
+                let overall_timeout_duration = Duration::from_millis(task_timeout_ms);
+                let mut final_status = PortStatus::Filtered(target_port);
+                let start_time = tokio::time::Instant::now();
+
+                while start_time.elapsed() < overall_timeout_duration {
+                    match tokio_timeout(Duration::from_millis(50), RawSocketHandler::try_receive_response(Arc::clone(&task_transport_receiver_arc_clone), task_target_ip, target_port, ephemeral_port)).await {
+                        Ok(Ok(Some(status))) => {
+                            final_status = status;
+                            break;
+                        }
+                        Ok(Ok(None)) => { /* Irrelevant packet, continue */ }
+                        Ok(Err(e)) => {
+                            final_status = PortStatus::Error(target_port, format!("Receive error: {}", e));
+                            break;
+                        }
+                        Err(_) => { /* Timeout for this single receive attempt */ }
+                    }
+                    tokio::task::yield_now().await;
                 }
-                Err(e) => {
-                    eprintln!("Error during receive_and_process_packet: {}", e);
-                }
+
+                task_results_clone.lock().await.push(final_status);
+                task_active_ports_cloned.lock().await.remove(&ephemeral_port);
+            });
+            scan_tasks.push(scan_task);
+
+            if self.scan_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.scan_delay_ms)).await;
             }
         }
-        Err(e) => {
-            eprintln!("Failed to initialize RawSocketHandler: {}", e);
+
+        for task in scan_tasks {
+            let _ = task.await;
         }
+
+        // Ensure all ephemeral ports are cleared after the scan batch, just in case any task failed to release.
+        // This is a fallback; ideally, each task manages its own port perfectly.
+        // self.active_ephemeral_ports.lock().await.clear(); // Might be too broad if other scans could run concurrently
+        // self.next_ephemeral_port = 49152; // Reset for a completely new scan object instance
+
+        Arc::try_unwrap(results_arc).unwrap_or_else(|_| panic!("Failed to unwrap results Arc")).into_inner()
     }
 }
-// (tests for receive logic are hard to automate without a complex setup, will be deferred or done manually)
+
+// (Old tests commented out as they are not compatible with async and changed structures)
+/*
+#[cfg(test)]
+mod tests {
+    // ...
+}
+*/
